@@ -54,11 +54,12 @@ def build_retrieved_chunk(
         RetrievedChunk: Chunk with source metadata.
 
     Raises:
-        KeyError: If the document is missing required metadata.
+        KeyError: If required chunk metadata is missing.
     """
     metadata = document.metadata
 
     return RetrievedChunk(
+        document_id=metadata.get("document_id"),
         chunk_index=metadata["chunk_index"],
         text=document.page_content,
         token_count=metadata["token_count"],
@@ -78,60 +79,101 @@ def create_index(
     document_store: DocumentStore = Depends(
         get_document_store
     ),
-    index_store: IndexStore = Depends(get_index_store),
+    index_store: IndexStore = Depends(
+        get_index_store
+    ),
     vector_service: VectorService = Depends(
         get_vector_service
     ),
 ) -> IndexRecord:
-    """Chunk an uploaded PDF and create a vector index.
+    """Chunk selected PDFs and create one shared vector index.
 
     Args:
-        request (IndexCreateRequest): Document and chunk settings.
+        request (IndexCreateRequest): PDF IDs and chunk settings.
         document_store (DocumentStore): Uploaded PDF storage.
         index_store (IndexStore): Index metadata storage.
         vector_service (VectorService): Qdrant vector service.
 
     Returns:
-        IndexRecord: Metadata for the newly created index.
+        IndexRecord: Metadata for the combined index.
 
     Raises:
-        HTTPException: If the document is missing or no
-            chunks can be generated.
+        HTTPException: If a PDF is missing or no chunks exist.
     """
-    document = document_store.get(request.document_id)
+    documents = []
 
-    if document is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Document not found.",
+    # Load every selected PDF.
+    for document_id in request.document_ids:
+        document = document_store.get(
+            document_id
         )
 
-    chunker = get_chunker(request.settings.technique)
+        if document is None:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"Document {document_id} not found."
+                ),
+            )
 
-    chunks = chunker.split(
-        paragraphs=document.paragraphs,
-        settings=request.settings,
+        documents.append(document)
+
+    # All PDFs use the same selected chunking strategy.
+    chunker = get_chunker(
+        request.settings.technique
     )
 
-    if not chunks:
-        raise HTTPException(
-            status_code=422,
-            detail="No chunks could be generated.",
+    document_batches = []
+
+    # Chunk each PDF separately to preserve boundaries.
+    for document in documents:
+        chunks = chunker.split(
+            paragraphs=document.paragraphs,
+            settings=request.settings,
+        )
+
+        if not chunks:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "No chunks could be generated from "
+                    f"{document.filename}."
+                ),
+            )
+
+        document_batches.append(
+            (
+                document.document_id,
+                document.filename,
+                chunks,
+            )
         )
 
     index_id = uuid4()
 
-    total_chunks = vector_service.create_index(
+    # Store all selected PDFs in one Qdrant collection.
+    total_chunks = vector_service.create_multi_index(
         index_id=index_id,
-        document_id=document.document_id,
-        filename=document.filename,
-        chunks=chunks,
+        document_batches=document_batches,
     )
 
     record = IndexRecord(
         index_id=index_id,
-        document_id=document.document_id,
-        filename=document.filename,
+
+        # Preserve backward-compatible fields.
+        document_id=documents[0].document_id,
+        filename=documents[0].filename,
+
+        # Store every document in the combined index.
+        document_ids=[
+            document.document_id
+            for document in documents
+        ],
+        filenames=[
+            document.filename
+            for document in documents
+        ],
+
         settings=request.settings,
         total_chunks=total_chunks,
         created_at=datetime.now(timezone.utc),
@@ -139,9 +181,12 @@ def create_index(
 
     try:
         index_store.save(record)
+
     except Exception:
-        # Roll back vectors if metadata cannot be saved.
-        vector_service.delete_index(index_id)
+        # Roll back Qdrant if metadata saving fails.
+        vector_service.delete_index(
+            index_id
+        )
         raise
 
     return record
@@ -152,7 +197,9 @@ def create_index(
     response_model=list[IndexRecord],
 )
 def list_indexes(
-    index_store: IndexStore = Depends(get_index_store),
+    index_store: IndexStore = Depends(
+        get_index_store
+    ),
 ) -> list[IndexRecord]:
     """List all saved PDF indexing experiments.
 
@@ -174,7 +221,9 @@ def list_indexes(
 )
 def get_index(
     index_id: UUID,
-    index_store: IndexStore = Depends(get_index_store),
+    index_store: IndexStore = Depends(
+        get_index_store
+    ),
 ) -> IndexRecord:
     """Retrieve metadata for a saved indexing experiment.
 
@@ -188,7 +237,9 @@ def get_index(
     Raises:
         HTTPException: If the requested index is missing.
     """
-    record = index_store.get(index_id)
+    record = index_store.get(
+        index_id
+    )
 
     if record is None:
         raise HTTPException(
@@ -205,12 +256,14 @@ def get_index(
 )
 def get_index_chunks(
     index_id: UUID,
-    index_store: IndexStore = Depends(get_index_store),
+    index_store: IndexStore = Depends(
+        get_index_store
+    ),
     vector_service: VectorService = Depends(
         get_vector_service
     ),
 ) -> IndexChunksResponse:
-    """List the text chunks stored in a vector index.
+    """List text chunks stored in a vector index.
 
     Args:
         index_id (UUID): Requested index identifier.
@@ -223,7 +276,9 @@ def get_index_chunks(
     Raises:
         HTTPException: If the index is missing.
     """
-    record = index_store.get(index_id)
+    record = index_store.get(
+        index_id
+    )
 
     if record is None:
         raise HTTPException(
@@ -232,7 +287,10 @@ def get_index_chunks(
         )
 
     try:
-        documents = vector_service.list_chunks(index_id)
+        documents = vector_service.list_chunks(
+            index_id
+        )
+
     except ValueError as exc:
         raise HTTPException(
             status_code=404,
@@ -240,7 +298,9 @@ def get_index_chunks(
         ) from exc
 
     chunks = [
-        build_retrieved_chunk(document)
+        build_retrieved_chunk(
+            document
+        )
         for document in documents
     ]
 
@@ -257,7 +317,9 @@ def get_index_chunks(
 )
 def delete_index(
     index_id: UUID,
-    index_store: IndexStore = Depends(get_index_store),
+    index_store: IndexStore = Depends(
+        get_index_store
+    ),
     vector_service: VectorService = Depends(
         get_vector_service
     ),
@@ -275,7 +337,9 @@ def delete_index(
     Raises:
         HTTPException: If the index does not exist.
     """
-    record = index_store.get(index_id)
+    record = index_store.get(
+        index_id
+    )
 
     if record is None:
         raise HTTPException(
@@ -283,8 +347,13 @@ def delete_index(
             detail="Index not found.",
         )
 
-    vector_service.delete_index(index_id)
-    index_store.delete(index_id)
+    vector_service.delete_index(
+        index_id
+    )
+
+    index_store.delete(
+        index_id
+    )
 
 
 @router.post(
@@ -293,7 +362,9 @@ def delete_index(
 )
 def search_chunks(
     request: RetrievalRequest,
-    index_store: IndexStore = Depends(get_index_store),
+    index_store: IndexStore = Depends(
+        get_index_store
+    ),
     vector_service: VectorService = Depends(
         get_vector_service
     ),
@@ -311,7 +382,9 @@ def search_chunks(
     Raises:
         HTTPException: If the index does not exist.
     """
-    record = index_store.get(request.index_id)
+    record = index_store.get(
+        request.index_id
+    )
 
     if record is None:
         raise HTTPException(
@@ -331,6 +404,7 @@ def search_chunks(
             question=request.question,
             top_k=top_k,
         )
+
     except ValueError as exc:
         raise HTTPException(
             status_code=404,
@@ -358,44 +432,74 @@ def search_chunks(
 )
 def chat_with_pdf(
     request: ChatRequest,
-    index_store: IndexStore = Depends(get_index_store),
-    rag_service: RAGService = Depends(get_rag_service),
+    index_store: IndexStore = Depends(
+        get_index_store
+    ),
+    rag_service: RAGService = Depends(
+        get_rag_service
+    ),
 ) -> ChatResponse:
-    """Answer a question using indexed PDF context and Groq.
+    """Handle greetings and PDF-based RAG questions.
 
     Args:
-        request (ChatRequest): Question and generation settings.
-        index_store (IndexStore): Index metadata storage.
-        rag_service (RAGService): RAG question-answering service.
+        request (ChatRequest): Message and generation settings.
+        index_store (IndexStore): Saved index metadata.
+        rag_service (RAGService): Groq and retrieval service.
 
     Returns:
-        ChatResponse: Generated answer and retrieved sources.
+        ChatResponse: Answer with optional PDF sources.
 
     Raises:
-        HTTPException: If the index is missing, the Groq
-            key is unconfigured, or RAG settings are invalid.
+        HTTPException: If the index is missing, settings are
+            invalid, or the Groq API key is unavailable.
     """
-    record = index_store.get(request.index_id)
-
-    if record is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Index not found.",
-        )
-
-    top_k = (
-        request.top_k
-        if request.top_k is not None
-        else record.settings.top_k
-    )
-
     max_output_tokens = (
-        request.max_output_tokens
-        if request.max_output_tokens is not None
-        else record.settings.max_output_tokens
+        request.max_output_tokens or 512
     )
 
     try:
+        # Greetings go to Groq directly without Qdrant.
+        if rag_service.is_greeting(
+            request.question
+        ):
+            return rag_service.greet(
+                question=request.question,
+                max_output_tokens=max_output_tokens,
+                index_id=request.index_id,
+            )
+
+        # Document questions require an existing PDF index.
+        if request.index_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Upload and index a PDF before "
+                    "asking document questions."
+                ),
+            )
+
+        record = index_store.get(
+            request.index_id
+        )
+
+        if record is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Index not found.",
+            )
+
+        top_k = (
+            request.top_k
+            if request.top_k is not None
+            else record.settings.top_k
+        )
+
+        max_output_tokens = (
+            request.max_output_tokens
+            if request.max_output_tokens is not None
+            else record.settings.max_output_tokens
+        )
+
         return rag_service.answer(
             index_id=request.index_id,
             question=request.question,
