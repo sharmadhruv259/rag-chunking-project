@@ -47,7 +47,6 @@ rag-chunking-project/
 │   ├── config.py
 │   ├── schemas.py
 │   └── main.py
-├── tests/                      # Local tests (Git-ignored)
 ├── data/                       # Local documents, indexes, Qdrant (Git-ignored)
 ├── .env.example
 ├── .gitignore
